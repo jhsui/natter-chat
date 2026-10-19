@@ -1,6 +1,7 @@
 import type {
   AuthResponse,
   ConversationsResponse,
+  DemoResponse,
   MessageResponse,
   MessagesResponse,
   PeopleResponse,
@@ -56,6 +57,8 @@ export const api = {
       body: { username, password },
     }),
   logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
+  /** Signs in as a new temporary guest, with Natter Bot waiting in a chat. */
+  demo: () => request<DemoResponse>("/auth/demo", { method: "POST" }),
   searchUsers: (q: string) =>
     request<UsersResponse>(`/users?q=${encodeURIComponent(q)}`),
   people: () => request<PeopleResponse>("/people"),

@@ -31,7 +31,8 @@ function isSingleEmoji(value: unknown): value is string {
   // A pictograph, a flag letter, or a keycap (as in 1️⃣).
   return /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u.test(value);
 }
-const room = (userId: number) => `user:${userId}`;
+/** The Socket.IO room holding every open tab of one user. */
+export const room = (userId: number) => `user:${userId}`;
 
 /** Data attached to each socket after the handshake is authenticated. */
 interface SocketData {
@@ -53,6 +54,30 @@ export function emitNewMessage(io: ChatServer, message: Message): void {
 }
 
 /**
+ * If a message has a link in it, looks up the link's preview and tells both
+ * people once it's ready. Call it after the message has been delivered, so a
+ * slow website never holds up a message.
+ */
+export async function addLinkPreview(
+  io: ChatServer,
+  db: Db,
+  linkPreviews: LinkPreviewFetcher | null | undefined,
+  message: Message,
+): Promise<void> {
+  const url = linkPreviews && findFirstUrl(message.body);
+  if (!url) return;
+  try {
+    const preview = await linkPreviews(url);
+    if (!preview || !(await db.setLinkPreview(message.id, preview))) return;
+    io.to(room(message.recipientId))
+      .to(room(message.senderId))
+      .emit("message:preview", { messageId: message.id, preview });
+  } catch (err) {
+    console.error("Couldn't add a link preview", err);
+  }
+}
+
+/**
  * Real-time layer. Every connected socket joins a private room named after
  * its user, so sending to `user:42` reaches all of user 42's open tabs.
  */
@@ -64,12 +89,18 @@ export function attachSocket(
     corsOrigin,
     chatImageStorage,
     linkPreviews,
+    onMessage,
+    onConnect,
   }: {
     corsOrigin?: string;
     /** Where chat pictures are kept, so a deleted message's file can be removed. */
     chatImageStorage?: ChatImageStorage | null;
     /** Looks up previews for links in messages; leave out to turn previews off. */
     linkPreviews?: LinkPreviewFetcher | null;
+    /** Called with each text message after it has been delivered (Natter Bot listens here). */
+    onMessage?: (message: Message) => void;
+    /** Called when a user opens a connection. */
+    onConnect?: (user: PublicUser) => void;
   } = {},
 ): ChatServer {
   const io: ChatServer = new Server(httpServer, {
@@ -91,31 +122,13 @@ export function attachSocket(
     }
   });
 
-  /**
-   * If a message has a link in it, looks up the link's preview and tells both
-   * people once it's ready. This runs after the message has been delivered,
-   * so a slow website never holds up a message.
-   */
-  async function addLinkPreview(message: Message) {
-    const url = linkPreviews && findFirstUrl(message.body);
-    if (!url) return;
-    try {
-      const preview = await linkPreviews(url);
-      if (!preview || !(await db.setLinkPreview(message.id, preview))) return;
-      io.to(room(message.recipientId))
-        .to(room(message.senderId))
-        .emit("message:preview", { messageId: message.id, preview });
-    } catch (err) {
-      console.error("Couldn't add a link preview", err);
-    }
-  }
-
   io.on("connection", (socket) => {
     const me = socket.data.user;
     socket.join(room(me.id));
     if (presence.connect(me.id)) {
       socket.broadcast.emit("presence", { userId: me.id, online: true });
     }
+    onConnect?.(me);
 
     // Database calls are async, so a fast typer's messages could finish out of
     // order. Chaining them per socket keeps each sender's messages in order.
@@ -143,7 +156,8 @@ export function attachSocket(
           });
           emitNewMessage(io, message);
           reply({ ok: true, message });
-          void addLinkPreview(message);
+          void addLinkPreview(io, db, linkPreviews, message);
+          onMessage?.(message);
         } catch (err) {
           console.error(err);
           reply({ error: "Couldn't send the message. Try again." });

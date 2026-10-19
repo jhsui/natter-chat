@@ -118,6 +118,15 @@ export interface Conversation extends UserWithPresence {
 
 export interface AuthResponse {
   user: PublicUser;
+  /** True for a temporary demo account (see DemoResponse). */
+  guest?: boolean;
+}
+
+/** Reply to starting the demo: a new guest account, already signed in. */
+export interface DemoResponse extends AuthResponse {
+  guest: true;
+  /** Natter Bot, who is waiting in a chat with the guest. */
+  bot: PublicUser;
 }
 
 export interface ProfileResponse {

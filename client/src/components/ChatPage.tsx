@@ -20,6 +20,10 @@ type ChatSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
 interface ChatPageProps {
   me: PublicUser;
+  /** True for a temporary demo account. */
+  guest: boolean;
+  /** Someone to open a chat with straight away (Natter Bot, for a new guest). */
+  startWith: PublicUser | null;
   /** Your own name or avatar changed. */
   onMeChange: (me: PublicUser) => void;
   onLogout: () => void;
@@ -38,7 +42,13 @@ const publicUser = ({
   avatarUrl,
 });
 
-export default function ChatPage({ me, onMeChange, onLogout }: ChatPageProps) {
+export default function ChatPage({
+  me,
+  guest,
+  startWith,
+  onMeChange,
+  onLogout,
+}: ChatPageProps) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [people, setPeople] = useState<Person[]>([]); // everyone, for the People tab
   const [active, setActive] = useState<PublicUser | null>(null); // the person we're chatting with
@@ -289,6 +299,15 @@ export default function ChatPage({ me, onMeChange, onLogout }: ChatPageProps) {
     return () => document.removeEventListener("visibilitychange", onVisible);
   }, [markRead]);
 
+  // A new guest lands straight in their chat with Natter Bot.
+  const startedRef = useRef(false);
+  useEffect(() => {
+    if (!startWith || startedRef.current) return;
+    startedRef.current = true;
+    openConversation(startWith);
+    // Only on arrival, so the dependency list is empty on purpose.
+  }, []);
+
   // --- Actions ----------------------------------------------------------------
   function openConversation(user: PublicUser) {
     if (activeRef.current?.id === user.id) return;
@@ -405,6 +424,7 @@ export default function ChatPage({ me, onMeChange, onLogout }: ChatPageProps) {
     <div className="app-shell">
       <Sidebar
         me={me}
+        guest={guest}
         conversations={conversations}
         people={people}
         drafts={draftsRef.current}

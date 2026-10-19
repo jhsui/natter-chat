@@ -98,8 +98,9 @@ export function authRoutes(db: Db): Router {
   router.get(
     "/me",
     requireAuth(db),
-    (req: Request, res: Response<AuthResponse>) => {
-      res.json({ user: currentUser(req) });
+    async (req: Request, res: Response<AuthResponse>) => {
+      const user = currentUser(req);
+      res.json({ user, guest: await db.isGuest(user.id) });
     },
   );
 

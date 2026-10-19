@@ -24,12 +24,15 @@ function getSecret(): string {
   return "dev-only-secret-change-me";
 }
 
-export function signToken(user: PublicUser): string {
+export function signToken(
+  user: PublicUser,
+  ttlSeconds = TOKEN_TTL_SECONDS,
+): string {
   return jwt.sign(
     { sub: String(user.id), username: user.username },
     getSecret(),
     {
-      expiresIn: TOKEN_TTL_SECONDS,
+      expiresIn: ttlSeconds,
     },
   );
 }
@@ -47,12 +50,17 @@ export function verifyToken(token: string | undefined): number | null {
   }
 }
 
-export function setAuthCookie(res: Response, user: PublicUser): void {
-  res.cookie(COOKIE_NAME, signToken(user), {
+/** Signs `user` in. `ttlSeconds` is how long that lasts (a week unless given). */
+export function setAuthCookie(
+  res: Response,
+  user: PublicUser,
+  ttlSeconds = TOKEN_TTL_SECONDS,
+): void {
+  res.cookie(COOKIE_NAME, signToken(user, ttlSeconds), {
     httpOnly: true,
     sameSite: "lax",
     secure: process.env.NODE_ENV === "production",
-    maxAge: TOKEN_TTL_SECONDS * 1000,
+    maxAge: ttlSeconds * 1000,
   });
 }
 

@@ -77,6 +77,12 @@ const SCHEMA = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (message_id, user_id)
   );
+
+  -- The demo: temporary guest accounts (deleted after a day, see demo.ts) and
+  -- the Natter Bot account that shows them around (bot.ts).
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_guest BOOLEAN NOT NULL DEFAULT false;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT false;
+  CREATE INDEX IF NOT EXISTS users_guest_idx ON users (created_at) WHERE is_guest;
 `;
 
 /** The public user fields, for a query where the users table is aliased as "u". */
@@ -125,14 +131,43 @@ export interface ConversationRow extends PublicUser {
   unread: number;
 }
 
+/** Extra fields for accounts the server makes itself (see createUser). */
+export interface NewUserOptions {
+  /** A temporary demo account: hidden from other people, deleted after a day. */
+  guest?: boolean;
+  /** The Natter Bot account. */
+  bot?: boolean;
+  displayName?: string;
+  bio?: string;
+  avatarUrl?: string;
+}
+
+/** The storage files of guests that were just deleted, to be removed too. */
+export interface DeletedGuests {
+  count: number;
+  avatarKeys: string[];
+  imageKeys: string[];
+}
+
 export interface Db {
   close(): Promise<void>;
   /** Returns null if the username is already taken. */
   createUser(
     username: string,
     passwordHash: string,
+    options?: NewUserOptions,
   ): Promise<ProfileRow | null>;
   findUserById(id: number): Promise<ProfileRow | undefined>;
+  /** The Natter Bot account, if it has been created. */
+  findBot(): Promise<ProfileRow | undefined>;
+  isGuest(id: number): Promise<boolean>;
+  countGuests(): Promise<number>;
+  /**
+   * Deletes guest accounts older than `maxAgeMs`, with their messages and
+   * reactions. Returns the storage keys of their avatars and of the pictures in
+   * their conversations, so those files can be removed as well.
+   */
+  deleteExpiredGuests(maxAgeMs: number): Promise<DeletedGuests>;
   updateProfile(
     id: number,
     fields: { displayName: string | null; bio: string | null },
@@ -146,8 +181,9 @@ export interface Db {
     avatar: { url: string; key: string } | null,
   ): Promise<{ profile: ProfileRow; previousKey: string | null }>;
   findUserByUsername(username: string): Promise<UserWithPassword | undefined>;
+  /** Finds people by username or display name. Guests are left out. */
   searchUsers(me: number, query: string): Promise<PublicUser[]>;
-  /** Every user except `me`, with the time of your latest message together (or null). */
+  /** Every user except `me` and guests, with the time of your latest message together (or null). */
   listPeople(me: number): Promise<(PublicUser & { lastAt: string | null })[]>;
   /**
    * Pass `image` (already uploaded to storage under `key`) for an image
@@ -359,13 +395,23 @@ export async function openDb(config: DbConfig): Promise<Db> {
   return {
     close: () => sql.close(),
 
-    async createUser(username, passwordHash) {
+    async createUser(username, passwordHash, options = {}) {
       // ON CONFLICT covers the race where two people grab the same name at once.
       const { rows } = await sql.query<ProfileRowRaw>(
-        `INSERT INTO users AS u (username, password_hash) VALUES ($1, $2)
+        `INSERT INTO users AS u
+           (username, password_hash, is_guest, is_bot, display_name, bio, avatar_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT ((lower(username))) DO NOTHING
          RETURNING ${PROFILE_COLUMNS}`,
-        [username, passwordHash],
+        [
+          username,
+          passwordHash,
+          options.guest ?? false,
+          options.bot ?? false,
+          options.displayName ?? null,
+          options.bio ?? null,
+          options.avatarUrl ?? null,
+        ],
       );
       return rows[0] ? toProfile(rows[0]) : null;
     },
@@ -376,6 +422,61 @@ export async function openDb(config: DbConfig): Promise<Db> {
         [id],
       );
       return rows[0] && toProfile(rows[0]);
+    },
+
+    async findBot() {
+      const { rows } = await sql.query<ProfileRowRaw>(
+        `SELECT ${PROFILE_COLUMNS} FROM users u WHERE u.is_bot ORDER BY u.id LIMIT 1`,
+      );
+      return rows[0] && toProfile(rows[0]);
+    },
+
+    async isGuest(id) {
+      const { rows } = await sql.query<{ isGuest: boolean }>(
+        `SELECT is_guest AS "isGuest" FROM users WHERE id = $1`,
+        [id],
+      );
+      return rows[0]?.isGuest ?? false;
+    },
+
+    async countGuests() {
+      const { rows } = await sql.query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM users WHERE is_guest`,
+      );
+      return rows[0]?.n ?? 0;
+    },
+
+    async deleteExpiredGuests(maxAgeMs) {
+      // Pick the accounts once, so every step below works on the same ones.
+      const { rows: guests } = await sql.query<{
+        id: number;
+        avatarKey: string | null;
+      }>(
+        `SELECT id, avatar_key AS "avatarKey" FROM users
+         WHERE is_guest AND created_at < now() - make_interval(secs => $1)`,
+        [maxAgeMs / 1000],
+      );
+      if (guests.length === 0)
+        return { count: 0, avatarKeys: [], imageKeys: [] };
+      const ids = guests.map((g) => g.id);
+
+      // Read the picture keys before deleting: deleting the users cascades to
+      // their messages, which takes the keys with them.
+      const { rows: images } = await sql.query<{ key: string }>(
+        `SELECT image_key AS key FROM messages
+         WHERE image_key IS NOT NULL
+           AND (sender_id = ANY($1::int[]) OR recipient_id = ANY($1::int[]))`,
+        [ids],
+      );
+      const { rowCount } = await sql.query(
+        `DELETE FROM users WHERE id = ANY($1::int[])`,
+        [ids],
+      );
+      return {
+        count: rowCount,
+        avatarKeys: guests.flatMap((g) => (g.avatarKey ? [g.avatarKey] : [])),
+        imageKeys: images.map((r) => r.key),
+      };
     },
 
     async updateProfile(id, { displayName, bio }) {
@@ -413,9 +514,11 @@ export async function openDb(config: DbConfig): Promise<Db> {
     async searchUsers(me, query) {
       // Escape LIKE wildcards so searching for "_" or "%" matches them literally.
       const escaped = query.replace(/[\\%_]/g, (c) => `\\${c}`);
+      // Guests (demo accounts) never show up for anyone else.
       const { rows } = await sql.query<PublicUser>(
         `SELECT ${USER_COLUMNS} FROM users u
-         WHERE u.id <> $1 AND (u.username ILIKE $2 OR u.display_name ILIKE $2)
+         WHERE u.id <> $1 AND NOT u.is_guest
+           AND (u.username ILIKE $2 OR u.display_name ILIKE $2)
          ORDER BY lower(u.username) LIMIT 20`,
         [me, `%${escaped}%`],
       );
@@ -430,7 +533,7 @@ export async function openDb(config: DbConfig): Promise<Db> {
                   WHERE (m.sender_id = u.id AND m.recipient_id = $1)
                      OR (m.sender_id = $1 AND m.recipient_id = u.id)) AS "lastAt"
          FROM users u
-         WHERE u.id <> $1
+         WHERE u.id <> $1 AND NOT u.is_guest
          ORDER BY lower(u.username)
          LIMIT 500`,
         [me],

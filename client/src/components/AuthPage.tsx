@@ -1,8 +1,8 @@
 import { useState, type SubmitEvent } from "react";
-import { Eye, EyeOff } from "lucide-react";
+import { Bot, Eye, EyeOff } from "lucide-react";
 import Brand from "./Brand.tsx";
 import { ThemeButton } from "../theme.tsx";
-import type { PublicUser } from "../../../shared/types";
+import type { AuthResponse, DemoResponse } from "../../../shared/types";
 import { api, errorMessage } from "../api.ts";
 import { cx, ui } from "../ui.ts";
 
@@ -39,7 +39,7 @@ function ConversationPreview() {
 }
 
 interface AuthPageProps {
-  onAuthenticated: (user: PublicUser) => void;
+  onAuthenticated: (auth: AuthResponse | DemoResponse) => void;
 }
 
 export default function AuthPage({ onAuthenticated }: AuthPageProps) {
@@ -47,7 +47,9 @@ export default function AuthPage({ onAuthenticated }: AuthPageProps) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [demoError, setDemoError] = useState("");
+  // Which button is waiting for the server, if any.
+  const [busy, setBusy] = useState<"form" | "demo" | null>(null);
   const [showPassword, setShowPassword] = useState(false);
 
   const isLogin = mode === "login";
@@ -55,21 +57,36 @@ export default function AuthPage({ onAuthenticated }: AuthPageProps) {
   async function handleSubmit(e: SubmitEvent<HTMLFormElement>) {
     e.preventDefault();
     setError("");
-    setBusy(true);
+    setDemoError("");
+    setBusy("form");
     try {
-      const { user } = isLogin
-        ? await api.login(username, password)
-        : await api.register(username, password);
-      onAuthenticated(user);
+      onAuthenticated(
+        isLogin
+          ? await api.login(username, password)
+          : await api.register(username, password),
+      );
     } catch (err) {
       setError(errorMessage(err));
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function startDemo() {
+    setError("");
+    setDemoError("");
+    setBusy("demo");
+    try {
+      onAuthenticated(await api.demo());
+    } catch (err) {
+      setDemoError(errorMessage(err));
+      setBusy(null);
     }
   }
 
   function switchMode() {
     setMode(isLogin ? "register" : "login");
     setError("");
+    setDemoError("");
   }
 
   return (
@@ -78,12 +95,14 @@ export default function AuthPage({ onAuthenticated }: AuthPageProps) {
       <aside className="auth-panel hidden flex-col p-10 md:flex">
         <div className="flex items-center gap-2.5">
           <Brand size={32} />
-          <span className="text-lg font-semibold tracking-[-0.01em]">Natter</span>
+          <span className="text-lg font-semibold tracking-[-0.01em]">
+            Natter
+          </span>
         </div>
         <ConversationPreview />
         <p className="max-w-80 text-sm text-muted">
-          Real-time messages with read receipts, replies, reactions, photos
-          and link previews.
+          Real-time messages with read receipts, replies, reactions, photos and
+          link previews.
         </p>
       </aside>
       <section className="relative grid place-items-center px-4 py-12">
@@ -162,9 +181,9 @@ export default function AuthPage({ onAuthenticated }: AuthPageProps) {
             <button
               className={cx(ui.btnPrimary, "mt-1 text-sm")}
               type="submit"
-              disabled={busy}
+              disabled={busy !== null}
             >
-              {busy
+              {busy === "form"
                 ? isLogin
                   ? "Signing in…"
                   : "Creating account…"
@@ -173,6 +192,39 @@ export default function AuthPage({ onAuthenticated }: AuthPageProps) {
                   : "Create account"}
             </button>
           </form>
+          <div
+            className="my-5 flex items-center gap-3 text-xs text-muted"
+            aria-hidden="true"
+          >
+            <span className="h-px flex-1 bg-line" />
+            or
+            <span className="h-px flex-1 bg-line" />
+          </div>
+          <button
+            type="button"
+            className={cx(
+              ui.btnGhost,
+              "flex w-full items-center justify-center gap-2 border border-line text-sm font-semibold",
+            )}
+            onClick={startDemo}
+            disabled={busy !== null}
+            aria-describedby="demo-note"
+          >
+            <Bot className="size-4.5 text-accent" aria-hidden="true" />
+            {busy === "demo" ? "Starting the demo…" : "Try the demo"}
+          </button>
+          <p
+            id="demo-note"
+            className="mt-2 text-center text-xs text-muted md:text-left"
+          >
+            No sign-up needed: you get a temporary account and a quick tour from
+            Natter Bot.
+          </p>
+          {demoError && (
+            <p className={cx(ui.error, "mt-2")} role="alert">
+              {demoError}
+            </p>
+          )}
           <p className="mt-6 text-center text-sm text-muted md:text-left">
             {isLogin ? "Don't have an account?" : "Already have an account?"}{" "}
             <button

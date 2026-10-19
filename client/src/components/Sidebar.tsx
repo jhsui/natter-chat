@@ -11,6 +11,8 @@ type Tab = "chats" | "people";
 
 interface SidebarProps {
   me: PublicUser;
+  /** True for a temporary demo account. */
+  guest: boolean;
   conversations: Conversation[];
   people: Person[];
   /** Unsent text per chat, by the other person's id. Shown for chats that aren't open. */
@@ -85,6 +87,7 @@ function sortPeople(
 
 export default function Sidebar({
   me,
+  guest,
   conversations,
   people,
   drafts,
@@ -309,7 +312,11 @@ export default function Sidebar({
           <span className="flex min-w-0 flex-col">
             <span className="truncate text-sm font-medium">{nameOf(me)}</span>
             <span className="text-xs text-muted">
-              {connected ? "Online" : "Reconnecting…"}
+              {!connected
+                ? "Reconnecting…"
+                : guest
+                  ? "Demo account · lasts a day"
+                  : "Online"}
             </span>
           </span>
         </button>
@@ -317,8 +324,8 @@ export default function Sidebar({
         <button
           className={cx(ui.iconBtn, "size-9")}
           onClick={onLogout}
-          aria-label="Log out"
-          title="Log out"
+          aria-label={guest ? "Leave the demo" : "Log out"}
+          title={guest ? "Leave the demo" : "Log out"}
         >
           <LogOut className="size-4.5" />
         </button>

@@ -29,6 +29,8 @@ const chat = await createServer({
   db: dbConfig,
   // LINK_PREVIEWS=off stops the server from downloading pages that messages link to.
   linkPreviews: process.env.LINK_PREVIEWS === "off" ? null : undefined,
+  // "Try the demo" guest accounts and Natter Bot. DEMO=off turns them off.
+  demo: process.env.DEMO !== "off",
   clientDist: path.join(serverRoot, "..", "client", "dist"),
   corsOrigin: process.env.CLIENT_ORIGIN, // only needed if the client is hosted on another domain
 });

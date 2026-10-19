@@ -4,7 +4,14 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { requireAuth } from "./auth.js";
+import { createBot, type Bot } from "./bot.js";
 import { openDb, type Db, type DbConfig } from "./db.js";
+import {
+  demoRoutes,
+  demoSettings,
+  startGuestCleanup,
+  type DemoOptions,
+} from "./demo.js";
 import { fetchLinkPreview, type LinkPreviewFetcher } from "./linkPreview.js";
 import { createPresence } from "./presence.js";
 import { attachSocket, emitNewMessage, type ChatServer } from "./socket.js";
@@ -29,6 +36,11 @@ export interface ServerOptions {
    * page (see linkPreview.ts); null turns link previews off.
    */
   linkPreviews?: LinkPreviewFetcher | null;
+  /**
+   * Turns on the demo: "Try the demo" guest accounts and Natter Bot (see
+   * demo.ts and bot.ts). Off unless given; `true` uses the default settings.
+   */
+  demo?: boolean | DemoOptions;
   clientDist?: string;
   corsOrigin?: string;
 }
@@ -38,6 +50,12 @@ export interface ChatApp {
   httpServer: http.Server;
   io: ChatServer;
   db: Db;
+  /** The demo's moving parts, when it's turned on. */
+  demo: {
+    bot: Bot;
+    /** Deletes expired guests now; resolves to how many. */
+    cleanUpGuests(): Promise<number>;
+  } | null;
   close(): Promise<void>;
 }
 
@@ -50,6 +68,7 @@ export async function createServer({
   avatarStorage = storageFromEnv(),
   chatImageStorage = chatImageStorageFromEnv(),
   linkPreviews = fetchLinkPreview,
+  demo = false,
   clientDist,
   corsOrigin,
 }: ServerOptions): Promise<ChatApp> {
@@ -57,11 +76,34 @@ export async function createServer({
   const presence = createPresence();
   const app = express();
   const httpServer = http.createServer(app);
+  // Natter Bot is created below, once the socket server it talks through exists.
+  let bot: Bot | null = null;
   const io = attachSocket(httpServer, db, presence, {
     corsOrigin,
     chatImageStorage,
     linkPreviews,
+    onMessage: (message) => bot?.receive(message),
+    onConnect: (user) => bot?.connected(user.id),
   });
+
+  const demoOptions = demo === true ? {} : demo || null;
+  const settings = demoSettings(demoOptions ?? {});
+  let cleanup: ReturnType<typeof startGuestCleanup> | null = null;
+  if (demoOptions) {
+    bot = await createBot({
+      db,
+      io,
+      presence,
+      chatImageStorage,
+      linkPreviews,
+      timing: demoOptions.botTiming,
+    });
+    cleanup = startGuestCleanup(
+      db,
+      { avatarStorage, chatImageStorage },
+      settings,
+    );
+  }
 
   app.disable("x-powered-by");
   app.use(express.json({ limit: "10kb" }));
@@ -70,14 +112,15 @@ export async function createServer({
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
   });
-  app.use("/api/auth", authRoutes(db));
+  app.use("/api/auth", authRoutes(db), demoRoutes(db, bot, settings));
   // Everything else under /api needs a signed-in user.
   app.use(
     "/api",
     requireAuth(db),
-    chatRoutes(db, presence, chatImageStorage, (message) =>
-      emitNewMessage(io, message),
-    ),
+    chatRoutes(db, presence, chatImageStorage, (message) => {
+      emitNewMessage(io, message);
+      bot?.receive(message); // a picture sent to Natter Bot gets an answer too
+    }),
     profileRoutes(db, presence, avatarStorage, (user) =>
       io.emit("profile:updated", user),
     ),
@@ -116,8 +159,11 @@ export async function createServer({
     httpServer,
     io,
     db,
+    demo: bot && cleanup ? { bot, cleanUpGuests: cleanup.run } : null,
     close: () =>
       new Promise<void>((resolve, reject) => {
+        bot?.stop();
+        cleanup?.stop();
         // Stops Socket.IO and the HTTP server, then closes the database connection.
         io.close(() => {
           db.close().then(resolve, reject);

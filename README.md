@@ -6,8 +6,9 @@ A real-time chat web app with user accounts and private 1:1 direct messages.
 
 ## Features
 
+- **Try the demo:** one click on the sign-in page creates a temporary guest account and opens a chat with **Natter Bot**, which gives a quick tour of read receipts, link previews, reactions, replies and photos (see [Demo](#demo-guest-accounts-and-natter-bot))
 - Sign up / sign in with username and password (passwords hashed with bcrypt)
-- **Chats | People** tabs in the sidebar: People lists every user, online first, then by most recent chat
+- **Chats | People** tabs in the sidebar: People lists every user (except demo guests), online first, then by most recent chat
 - **Profiles:** upload an avatar (cropped and resized in the browser, stored in Supabase Storage), set a display name and a short bio, and view other people's profiles. Changes show up live for everyone
 - Filter existing conversations in **Chats**, or find anyone by username or display name in **People**
 - Messages arrive instantly over WebSockets and are saved to PostgreSQL
@@ -54,7 +55,7 @@ Both run exactly the same SQL (`server/src/db.ts`). Tables are created automatic
 - To use a real Postgres locally, put `DATABASE_URL=...` in `server/.env`.
 - To start over with an empty local database, stop the app and delete `server/data/pglite`.
 - To browse the data, point any Postgres client (pgAdmin, TablePlus, `psql`) at your `DATABASE_URL`. PGlite's folder can only be opened by the app itself.
-- Tests use a throwaway in-memory PGlite by default. `TEST_DATABASE_URL=postgres://... npm test` runs them against a real server instead (**it wipes the `users`, `messages` and `reactions` tables in that database**).
+- Tests use a throwaway in-memory PGlite by default. `TEST_DATABASE_URL=postgres://... npm test` runs the main suite against a real server instead (**it wipes the `users`, `messages` and `reactions` tables in that database**). The demo tests always use in-memory databases, since they start several servers.
 
 ## Avatars and chat images (Supabase Storage)
 
@@ -101,13 +102,27 @@ When a text message contains a link, the server downloads that page once and rea
 - **Preview pictures load from the other site**, straight into each person's browser, so that site sees their IP address when the card is shown (as it would if they opened the link). The request doesn't include this app's address.
 - Set `LINK_PREVIEWS=off` in `server/.env` to turn previews off; links stay clickable.
 
+## Demo (guest accounts and Natter Bot)
+
+"Try the demo" on the sign-in page lets visitors try Natter without signing up. It's on by default; set `DEMO=off` in `server/.env` to turn it off.
+
+- **Guest accounts:** `POST /api/auth/demo` creates an account named like `guest_4821` ("Guest 4821") with a random password that's never stored, so it can only be used through its login cookie. Guests are left out of everyone else's People list and search, and after a day they're deleted, with their messages, reactions and storage files (`server/src/demo.ts` checks hourly). At most 60 guests are created per 10 minutes and at most 500 exist at once, so a script can't fill the database.
+- **Natter Bot** (`server/src/bot.ts`) is a regular account that answers like a person: it marks your message read, shows "typing…" for a moment, then replies. Quick messages in a row get one answer. Its first replies are a short tour, one feature each:
+  1. explains the read receipt you just saw, and asks for a link
+  2. comments on the link's preview card (or says honestly if the site gave no preview). If you skip the link, it sends one: this repo
+  3. reacts ❤️ to your message and replies to it, quoting it
+  4. sends a photo (`server/assets/natter-bot-photo.webp`), if image storage is set up
+  5. suggests a few more things to try
+
+  After that it keeps chatting from a pool of lines, never the same one twice in a row, and reacts to the odd message. It's scripted, so it costs nothing to run and every visitor sees the same tour. It always shows as online, and anyone can find it in People.
+
 ## Scripts (run from the project root)
 
 | Command             | What it does                                                                                 |
 | ------------------- | -------------------------------------------------------------------------------------------- |
 | `npm run dev`       | Server (runs the `.ts` files directly with tsx, restarts on change) + Vite dev server        |
 | `npm run typecheck` | Type-checks the server, tests and client with `tsc`                                          |
-| `npm test`          | Server tests: auth, search, live messaging, read receipts, paging, profiles, image messages  |
+| `npm test`          | Server tests: auth, search, live messaging, read receipts, paging, profiles, image messages, the demo and Natter Bot |
 | `npm run build`     | Type-checks and builds the client into `client/dist`, compiles the server into `server/dist` |
 | `npm start`         | Runs the compiled server (`server/dist`); serves `client/dist` too                           |
 
@@ -168,9 +183,12 @@ natter-chat/
 │   │   ├── presence.ts      online tracking
 │   │   ├── linkPreview.ts   downloads a linked page (safely) and reads its title/description/picture
 │   │   ├── storage.ts       Supabase Storage for avatars and chat images + image type check
+│   │   ├── demo.ts          "Try the demo": guest accounts, their limits and hourly cleanup
+│   │   ├── bot.ts           Natter Bot: the scripted tour and small talk
 │   │   └── routes/          auth.ts (register/login/logout/me), chat.ts (users, conversations, messages, send/serve images),
 │   │                        profile.ts (view/edit profile, upload/remove avatar)
-│   ├── test/chat.test.ts    node:test suite (run with tsx)
+│   ├── assets/              the photo Natter Bot sends
+│   ├── test/                node:test suites (run with tsx): chat.test.ts, linkPreview.test.ts, demo.test.ts
 │   └── data/pglite/         local PGlite database (created on first run, git-ignored)
 └── client/
     ├── tsconfig.json
