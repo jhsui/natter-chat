@@ -25,8 +25,10 @@ const dbConfig: DbConfig = databaseUrl
         process.env.PGLITE_DIR || path.join(serverRoot, "data", "pglite"),
     };
 
-// How many proxies are in front of the server (1 on Railway), so rate limits
-// see each visitor's real IP. Leave it unset when there's no proxy.
+// How many proxy hops to step back through, so rate limits see each visitor's
+// real IP. 2 on Railway: X-Forwarded-For arrives as "<client>, <Railway edge>",
+// so 1 stops at the edge and every user shares one budget. Leave it unset when
+// there's no proxy.
 const proxies = Number(process.env.TRUST_PROXY);
 
 const chat = await createServer({

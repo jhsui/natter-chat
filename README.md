@@ -138,9 +138,11 @@ When a text message contains a link, the server downloads that page once and rea
 
 ### Behind a proxy: `TRUST_PROXY`
 
-On Railway (and most hosts) requests reach the server through a proxy, so without help every visitor seems to come from the proxy's IP address and they'd all share one budget. Set **`TRUST_PROXY=1`** (the number of proxies in front of the server) so the server takes each visitor's IP from the `X-Forwarded-For` header the proxy adds.
+On Railway (and most hosts) requests reach the server through proxies, so without help every visitor seems to come from a proxy's IP address and they'd all share one budget. `TRUST_PROXY` tells the server how many hops to step back from its own connection to find the visitor's IP in the `X-Forwarded-For` header.
 
-Leave it unset when nothing sits in front of the server, as in local development. If it's set without a proxy, or higher than the real number of proxies, anyone can send a made-up `X-Forwarded-For` and get a fresh budget each time.
+**On Railway, set `TRUST_PROXY=2`.** Railway removes any `X-Forwarded-For` a client sends, and the server always receives `<client>, <Railway edge>`. The connection itself counts as the first hop and the edge entry as the second, so `TRUST_PROXY=1` stops at the edge: `req.ip` is then one of Railway's edge addresses (two of them take turns) and every user shares their budgets. `TRUST_PROXY=2` gets past the edge to the client.
+
+Leave it unset when nothing sits in front of the server, as in local development. If it's set without a proxy, or too high on a host that keeps client-sent values, anyone can send a made-up `X-Forwarded-For` and get a fresh budget each time. If it's too low, `req.ip` is a proxy's address and visitors share budgets.
 
 **Checking it after deploying.** The limits are counted by `req.ip`, so you can check that `req.ip` is each visitor's real IP, not the proxy's, by watching a limit. This uses a username nobody has, `trust_proxy_check`, which can be tried 10 times per IP:
 
@@ -154,9 +156,14 @@ Leave it unset when nothing sits in front of the server, as in local development
    done
    ```
 
-   You should see `401` ten times, then `429`. If you only see `401`, the server believes the made-up header: `TRUST_PROXY` is higher than the number of proxies.
+   You should see `401` ten times, then `429`. A second run within 15 minutes is all `429`, which is fine too. Anything else means `req.ip` isn't one steady address for you:
 
-2. **Other visitors aren't affected.** Right after that, sign in as `trust_proxy_check` (any password) from another network, such as a phone on mobile data with Wi-Fi off. You should get "Wrong username or password". If you get "Too many attempts", everyone shares the proxy's IP: `TRUST_PROXY` isn't set, or the host has more proxies than it says.
+   - **Only `401`** has two possible causes. Either the server believes the made-up header (`TRUST_PROXY` is too high, on a host that keeps client-sent values), or `req.ip` is a proxy address that keeps changing, so the tries are split between several budgets (`TRUST_PROXY` is too low). On Railway it's the second, since Railway removes the made-up header: `TRUST_PROXY=1` splits them between its two edge addresses.
+   - **A `401` after a `429`** means the same as the second cause: different requests were counted under different addresses.
+
+2. **Other visitors aren't affected.** Right after that, sign in as `trust_proxy_check` (any password) from another network, such as a phone on mobile data with Wi-Fi off. You should get "Wrong username or password". If you get "Too many attempts", everyone shares a proxy's IP: `TRUST_PROXY` is unset or too low.
+
+Both steps have to pass. With `TRUST_PROXY` too low, either one can look right by itself, depending on which proxy address a request happens to arrive through.
 
 This only blocks `trust_proxy_check` from your IP, for 15 minutes (or until a restart). It also uses 11 of your IP's 30 sign-in attempts for that time; signing in to real accounts still works.
 
@@ -278,4 +285,4 @@ Image messages are sent with `POST /api/messages/:userId/image?width=…&height=
 - More rate limits: reactions, deleting messages and the typing indicator aren't limited yet (signing in, signing up and sending are, see [Rate limits](#rate-limits))
 - Keep the rate limit counts in Postgres (or Redis) if the server ever runs as more than one instance, so they're shared and survive restarts
 - Edit messages
-- Deploy (Railway, Render or Fly.io) — add a Postgres database, and set `DATABASE_URL`, `JWT_SECRET`, `NODE_ENV=production` and `TRUST_PROXY=1` (see [Behind a proxy](#behind-a-proxy-trust_proxy))
+- Deploy (Railway, Render or Fly.io) — add a Postgres database, and set `DATABASE_URL`, `JWT_SECRET`, `NODE_ENV=production` and `TRUST_PROXY=2` on Railway (see [Behind a proxy](#behind-a-proxy-trust_proxy))

@@ -1230,6 +1230,40 @@ test("X-Forwarded-For is only believed behind a trusted proxy; IPv6 is limited p
   }
 });
 
+test("Railway's X-Forwarded-For: trustProxy 2 finds the client, 1 stops at the edge", async () => {
+  // Railway always sends "<client>, <edge>", with two edge addresses in turn.
+  const [edge1, edge2] = ["10.1.0.1", "10.1.0.2"];
+  const [ann, ben] = ["198.51.100.7", "198.51.100.8"];
+  const tryFrom = (url: string, visitor: string, edge: string) =>
+    client(url, { "X-Forwarded-For": `${visitor}, ${edge}` }).request(
+      "POST",
+      "/api/auth/login",
+      { username: "nobody", password: "wrong!!" },
+    );
+
+  const two = await limitedServer({ loginPerIp: 2 }, { trustProxy: 2 });
+  try {
+    // Ann has one budget, whichever edge she arrives through...
+    assert.equal((await tryFrom(two.url, ann, edge1)).status, 401);
+    assert.equal((await tryFrom(two.url, ann, edge2)).status, 401);
+    assert.equal((await tryFrom(two.url, ann, edge1)).status, 429);
+    // ...and Ben has his own, through the same edge.
+    assert.equal((await tryFrom(two.url, ben, edge1)).status, 401);
+  } finally {
+    await two.close();
+  }
+
+  // One hop too few: everyone on an edge address shares its budget.
+  const one = await limitedServer({ loginPerIp: 2 }, { trustProxy: 1 });
+  try {
+    assert.equal((await tryFrom(one.url, ann, edge1)).status, 401);
+    assert.equal((await tryFrom(one.url, ann, edge1)).status, 401);
+    assert.equal((await tryFrom(one.url, ben, edge1)).status, 429);
+  } finally {
+    await one.close();
+  }
+});
+
 /** Signs up `username` on the server at `url`; returns the client and the new id. */
 async function signedUp(url: string, username: string) {
   const c = client(url);

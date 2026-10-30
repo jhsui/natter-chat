@@ -27,6 +27,7 @@ Run `npm run typecheck` and `npm test` before saying a change is done, and show 
 - These files are security-sensitive: `server/src/linkPreview.ts` (SSRF guards), `server/src/auth.ts`, and the image routes in `server/src/routes/chat.ts`. Do not weaken them. Any change there needs a test, and tell me explicitly so I review it line by line.
 - Link previews only fetch `http(s)` on standard ports, check the IP actually connected to, re-check every redirect, and stop after 5 seconds or 2 MB. Keep all of that.
 - Chat images are served only to the sender and recipient; everyone else gets a 404, not a 403. Uploaded files are checked by their first bytes, not their extension.
+- `TRUST_PROXY` must be 2 on Railway. `X-Forwarded-For` arrives as `<client>, <Railway edge>` (Railway removes client-sent values), so 1 makes `req.ip` an edge address and every user shares one rate limit budget. Leave it unset when there's no proxy, or anyone can fake their IP. See "Behind a proxy" in the README.
 - Never read, print or log `.env` files or secrets. `SUPABASE_SECRET_KEY` and `JWT_SECRET` stay on the server.
 
 ## Working rules
