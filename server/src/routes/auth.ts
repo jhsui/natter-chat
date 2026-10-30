@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import bcrypt from "bcryptjs";
 import type { AuthResponse, ErrorResponse } from "../../../shared/types.js";
@@ -43,6 +44,28 @@ function validate(
 
 type AuthReply = AuthResponse | ErrorResponse;
 
+// TEMPORARY, for checking TRUST_PROXY on Railway: revert this commit afterwards.
+const INSTANCE_ID = randomBytes(4).toString("hex");
+
+/**
+ * TEMPORARY. Logs where a sign-in came from, as JSON so a made-up header can't
+ * forge a log line. Never add the body here: it holds the password.
+ */
+function logLoginRequest(req: Request): void {
+  console.log(
+    "login-debug",
+    JSON.stringify({
+      instance: INSTANCE_ID,
+      replica: process.env.RAILWAY_REPLICA_ID ?? null,
+      ip: req.ip ?? null,
+      ips: req.ips,
+      xForwardedFor: req.get("x-forwarded-for") ?? null,
+      xRealIp: req.get("x-real-ip") ?? null,
+      remoteAddress: req.socket.remoteAddress ?? null,
+    }),
+  );
+}
+
 /** Sign-up, sign-in and sign-out. With `limits` null, nothing is rate-limited. */
 export function authRoutes(db: Db, limits: RateLimits | null): Router {
   const router = Router();
@@ -79,6 +102,7 @@ export function authRoutes(db: Db, limits: RateLimits | null): Router {
   });
 
   router.post("/login", async (req: Request, res: Response<AuthReply>) => {
+    logLoginRequest(req); // before the limits, so refused sign-ins show up too
     const ip = ipKey(req.ip);
     if (
       limits &&
