@@ -8,6 +8,7 @@ A real-time chat web app with user accounts and private 1:1 direct messages.
 
 - **Try the demo:** one click on the sign-in page creates a temporary guest account and opens a chat with **Natter Bot**, which gives a quick tour of read receipts, link previews, reactions, replies and photos (see [Demo](#demo-guest-accounts-and-natter-bot))
 - Sign up / sign in with username and password (passwords hashed with bcrypt)
+- **Rate limits** on signing in, signing up and sending messages, so nobody can guess passwords quickly or flood a chat (see [Rate limits](#rate-limits))
 - **Chats | People** tabs in the sidebar: People lists every user (except demo guests), online first, then by most recent chat
 - **Profiles:** upload an avatar (cropped and resized in the browser, stored in Supabase Storage), set a display name and a short bio, and view other people's profiles. Changes show up live for everyone
 - Filter existing conversations in **Chats**, or find anyone by username or display name in **People**
@@ -116,13 +117,56 @@ When a text message contains a link, the server downloads that page once and rea
 
   After that it keeps chatting from a pool of lines, never the same one twice in a row, and reacts to the odd message. It's scripted, so it costs nothing to run and every visitor sees the same tour. It always shows as online, and anyone can find it in People.
 
+## Rate limits
+
+`server/src/rateLimit.ts` limits how fast people can sign in, sign up and send messages:
+
+| What                           | Limit                                    | Counted per                 |
+| ------------------------------ | ---------------------------------------- | --------------------------- |
+| Sign-in attempts               | 30 per 15 minutes                        | IP address                  |
+| Sign-in tries for one username | 10 per 15 minutes (cleared by a success) | IP address + username       |
+| Sign-up attempts               | 10 per hour                              | IP address                  |
+| Messages (text and pictures)   | 20 per 10 seconds                        | user, across all their tabs |
+
+- **What people see:** "Too many attempts, try again in 15 minutes" (or "in N seconds" for a wait under a minute) on the sign-in form, or in the message box, which keeps the text they typed. Over HTTP the server answers `429` with `{ error, retryAfterSeconds }` and a `Retry-After` header; a refused `message:send` gets the same `error` and `retryAfterSeconds` in its ack.
+- **Every attempt counts**, including wrong passwords, invalid input and sign-ups for names that are taken, so a `409` can't be used to check quickly which usernames exist. Once a limit is reached, even the right password is refused until the wait is over.
+- **One username's tries are counted per IP**, so someone guessing a password from their own machine can't lock the real owner out; the per-IP limit covers one machine trying many usernames.
+- **Only sending is limited.** Someone over the message limit still receives messages live, and their typing indicator and read receipts keep working. Natter Bot isn't limited, and "Try the demo" keeps its own limits (see [Demo](#demo-guest-accounts-and-natter-bot)).
+- **The counts live in memory.** They reset when the server restarts, and they aren't shared between instances: two servers would each allow the full limit. That's fine while Natter runs as one instance; see [Ideas for next steps](#ideas-for-next-steps) for scaling out.
+- **People who share an IP address share its sign-in and sign-up budgets.** An office, a school or a mobile network that puts many customers behind one address (carrier-grade NAT) counts as one visitor, so a busy one can hit 10 sign-ups an hour. IPv6 addresses are grouped by their first 64 bits, since one device usually has a whole /64 to pick from.
+- The tests turn the limits off on their shared servers (`rateLimits: false` in `createServer`) and test them on servers of their own, with a clock they move by hand.
+
+### Behind a proxy: `TRUST_PROXY`
+
+On Railway (and most hosts) requests reach the server through a proxy, so without help every visitor seems to come from the proxy's IP address and they'd all share one budget. Set **`TRUST_PROXY=1`** (the number of proxies in front of the server) so the server takes each visitor's IP from the `X-Forwarded-For` header the proxy adds.
+
+Leave it unset when nothing sits in front of the server, as in local development. If it's set without a proxy, or higher than the real number of proxies, anyone can send a made-up `X-Forwarded-For` and get a fresh budget each time.
+
+**Checking it after deploying.** The limits are counted by `req.ip`, so you can check that `req.ip` is each visitor's real IP, not the proxy's, by watching a limit. This uses a username nobody has, `trust_proxy_check`, which can be tried 10 times per IP:
+
+1. **A made-up header doesn't help.** From your computer, run (with your app's address):
+
+   ```bash
+   for i in $(seq 1 11); do
+     curl -s -o /dev/null -w "%{http_code}\n" -X POST https://your-app.up.railway.app/api/auth/login \
+       -H "Content-Type: application/json" -H "X-Forwarded-For: 203.0.113.$i" \
+       -d '{"username":"trust_proxy_check","password":"wrong"}'
+   done
+   ```
+
+   You should see `401` ten times, then `429`. If you only see `401`, the server believes the made-up header: `TRUST_PROXY` is higher than the number of proxies.
+
+2. **Other visitors aren't affected.** Right after that, sign in as `trust_proxy_check` (any password) from another network, such as a phone on mobile data with Wi-Fi off. You should get "Wrong username or password". If you get "Too many attempts", everyone shares the proxy's IP: `TRUST_PROXY` isn't set, or the host has more proxies than it says.
+
+This only blocks `trust_proxy_check` from your IP, for 15 minutes (or until a restart). It also uses 11 of your IP's 30 sign-in attempts for that time; signing in to real accounts still works.
+
 ## Scripts (run from the project root)
 
 | Command             | What it does                                                                                 |
 | ------------------- | -------------------------------------------------------------------------------------------- |
 | `npm run dev`       | Server (runs the `.ts` files directly with tsx, restarts on change) + Vite dev server        |
 | `npm run typecheck` | Type-checks the server, tests and client with `tsc`                                          |
-| `npm test`          | Server tests: auth, search, live messaging, read receipts, paging, profiles, image messages, the demo and Natter Bot |
+| `npm test`          | Server tests: auth, search, live messaging, read receipts, paging, profiles, image messages, rate limits, the demo and Natter Bot |
 | `npm run build`     | Type-checks and builds the client into `client/dist`, compiles the server into `server/dist` |
 | `npm start`         | Runs the compiled server (`server/dist`); serves `client/dist` too                           |
 
@@ -181,6 +225,7 @@ natter-chat/
 │   │   ├── auth.ts          JWT cookie helpers + requireAuth middleware
 │   │   ├── socket.ts        real-time events
 │   │   ├── presence.ts      online tracking
+│   │   ├── rateLimit.ts     rate limits on signing in, signing up and sending messages
 │   │   ├── linkPreview.ts   downloads a linked page (safely) and reads its title/description/picture
 │   │   ├── storage.ts       Supabase Storage for avatars and chat images + image type check
 │   │   ├── demo.ts          "Try the demo": guest accounts, their limits and hourly cleanup
@@ -188,7 +233,7 @@ natter-chat/
 │   │   └── routes/          auth.ts (register/login/logout/me), chat.ts (users, conversations, messages, send/serve images),
 │   │                        profile.ts (view/edit profile, upload/remove avatar)
 │   ├── assets/              the photo Natter Bot sends
-│   ├── test/                node:test suites (run with tsx): chat.test.ts, linkPreview.test.ts, demo.test.ts
+│   ├── test/                node:test suites (run with tsx): chat.test.ts, linkPreview.test.ts, rateLimit.test.ts, demo.test.ts
 │   └── data/pglite/         local PGlite database (created on first run, git-ignored)
 └── client/
     ├── tsconfig.json
@@ -230,6 +275,7 @@ Image messages are sent with `POST /api/messages/:userId/image?width=…&height=
 
 - Group chats (a `conversations` + `participants` table instead of sender/recipient pairs)
 - Captions on images, other file attachments, animated GIFs
-- Rate limiting on login and message sending (e.g. `express-rate-limit`)
+- More rate limits: reactions, deleting messages and the typing indicator aren't limited yet (signing in, signing up and sending are, see [Rate limits](#rate-limits))
+- Keep the rate limit counts in Postgres (or Redis) if the server ever runs as more than one instance, so they're shared and survive restarts
 - Edit messages
-- Deploy (Railway, Render or Fly.io) — add a Postgres database, and set `DATABASE_URL`, `JWT_SECRET` and `NODE_ENV=production`
+- Deploy (Railway, Render or Fly.io) — add a Postgres database, and set `DATABASE_URL`, `JWT_SECRET`, `NODE_ENV=production` and `TRUST_PROXY=1` (see [Behind a proxy](#behind-a-proxy-trust_proxy))
