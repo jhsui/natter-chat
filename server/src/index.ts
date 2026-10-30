@@ -25,12 +25,17 @@ const dbConfig: DbConfig = databaseUrl
         process.env.PGLITE_DIR || path.join(serverRoot, "data", "pglite"),
     };
 
+// How many proxies are in front of the server (1 on Railway), so rate limits
+// see each visitor's real IP. Leave it unset when there's no proxy.
+const proxies = Number(process.env.TRUST_PROXY);
+
 const chat = await createServer({
   db: dbConfig,
   // LINK_PREVIEWS=off stops the server from downloading pages that messages link to.
   linkPreviews: process.env.LINK_PREVIEWS === "off" ? null : undefined,
   // "Try the demo" guest accounts and Natter Bot. DEMO=off turns them off.
   demo: process.env.DEMO !== "off",
+  trustProxy: Number.isInteger(proxies) && proxies > 0 ? proxies : false,
   clientDist: path.join(serverRoot, "..", "client", "dist"),
   corsOrigin: process.env.CLIENT_ORIGIN, // only needed if the client is hosted on another domain
 });

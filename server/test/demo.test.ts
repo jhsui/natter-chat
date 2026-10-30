@@ -75,6 +75,8 @@ async function start(options: Partial<ServerOptions>) {
   const server = await createServer({
     db: { pgliteDir: "memory://" },
     linkPreviews: fakeLinkPreviews,
+    // These tests sign up and send faster than people do.
+    rateLimits: false,
     ...options,
   });
   await new Promise<void>((resolve) => server.httpServer.listen(0, resolve));

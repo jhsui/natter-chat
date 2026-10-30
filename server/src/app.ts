@@ -14,6 +14,11 @@ import {
 } from "./demo.js";
 import { fetchLinkPreview, type LinkPreviewFetcher } from "./linkPreview.js";
 import { createPresence } from "./presence.js";
+import {
+  createRateLimits,
+  rateLimitSettings,
+  type RateLimitOptions,
+} from "./rateLimit.js";
 import { attachSocket, emitNewMessage, type ChatServer } from "./socket.js";
 import { authRoutes } from "./routes/auth.js";
 import { chatRoutes } from "./routes/chat.js";
@@ -41,6 +46,17 @@ export interface ServerOptions {
    * demo.ts and bot.ts). Off unless given; `true` uses the default settings.
    */
   demo?: boolean | DemoOptions;
+  /**
+   * Limits on signing in, signing up and sending messages (see rateLimit.ts).
+   * On with the defaults unless given; false turns them off.
+   */
+  rateLimits?: RateLimitOptions | false;
+  /**
+   * How many proxies sit in front of the server, so `req.ip` is the visitor's
+   * address from X-Forwarded-For rather than the proxy's. Leave it off when
+   * there's no proxy, or anyone could fake their IP to get around the limits.
+   */
+  trustProxy?: number | false;
   clientDist?: string;
   corsOrigin?: string;
 }
@@ -69,6 +85,8 @@ export async function createServer({
   chatImageStorage = chatImageStorageFromEnv(),
   linkPreviews = fetchLinkPreview,
   demo = false,
+  rateLimits = {},
+  trustProxy = false,
   clientDist,
   corsOrigin,
 }: ServerOptions): Promise<ChatApp> {
@@ -105,7 +123,12 @@ export async function createServer({
     );
   }
 
+  const limits = rateLimits
+    ? createRateLimits(rateLimitSettings(rateLimits))
+    : null;
+
   app.disable("x-powered-by");
+  if (trustProxy !== false) app.set("trust proxy", trustProxy);
   app.use(express.json({ limit: "10kb" }));
   app.use(cookieParser());
 
@@ -164,6 +187,7 @@ export async function createServer({
       new Promise<void>((resolve, reject) => {
         bot?.stop();
         cleanup?.stop();
+        limits?.stop();
         // Stops Socket.IO and the HTTP server, then closes the database connection.
         io.close(() => {
           db.close().then(resolve, reject);

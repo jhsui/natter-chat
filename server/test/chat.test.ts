@@ -79,6 +79,9 @@ before(async () => {
     avatarStorage: fakeStorage,
     chatImageStorage: fakeChatImages,
     linkPreviews: fakeLinkPreviews.fetch,
+    // These tests sign up and send faster than people do; the rate limit
+    // tests below start servers of their own.
+    rateLimits: false,
   });
   await new Promise<void>((resolve) => server.httpServer.listen(0, resolve));
   baseUrl = `http://localhost:${(server.httpServer.address() as AddressInfo).port}`;
