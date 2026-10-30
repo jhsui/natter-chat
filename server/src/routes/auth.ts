@@ -8,6 +8,7 @@ import {
   setAuthCookie,
 } from "../auth.js";
 import { toPublicUser, type Db } from "../db.js";
+import { ipKey, refuseIfLimited, type RateLimits } from "../rateLimit.js";
 
 const USERNAME_RE = /^[a-zA-Z0-9_]{3,20}$/;
 
@@ -42,10 +43,18 @@ function validate(
 
 type AuthReply = AuthResponse | ErrorResponse;
 
-export function authRoutes(db: Db): Router {
+/** Sign-up, sign-in and sign-out. With `limits` null, nothing is rate-limited. */
+export function authRoutes(db: Db, limits: RateLimits | null): Router {
   const router = Router();
 
   router.post("/register", async (req: Request, res: Response<AuthReply>) => {
+    // Every attempt counts, so a 409 can't be used to check names quickly.
+    if (
+      limits &&
+      refuseIfLimited(res, limits.register.hit(ipKey(req.ip)), "sign-up attempts")
+    )
+      return;
+
     const result = validate(req.body);
     if (!result.ok) {
       res.status(400).json({ error: result.error });
@@ -70,9 +79,31 @@ export function authRoutes(db: Db): Router {
   });
 
   router.post("/login", async (req: Request, res: Response<AuthReply>) => {
+    const ip = ipKey(req.ip);
+    if (
+      limits &&
+      refuseIfLimited(res, limits.loginIp.hit(ip), "sign-in attempts")
+    )
+      return;
+
     const { username, password } = (req.body ?? {}) as Partial<
       Record<keyof Credentials, unknown>
     >;
+    // Tries are also counted per username, from this IP only, so nobody can
+    // lock someone else out. The try is counted before the password is checked
+    // (and forgotten if it's right), so parallel guesses can't slip past. A
+    // name no account can have is only counted per IP.
+    const nameKey =
+      typeof username === "string" && USERNAME_RE.test(username)
+        ? `${ip} ${username.toLowerCase()}`
+        : null;
+    if (
+      limits &&
+      nameKey &&
+      refuseIfLimited(res, limits.loginName.hit(nameKey), "sign-in attempts")
+    )
+      return;
+
     const record =
       typeof username === "string"
         ? await db.findUserByUsername(username)
@@ -86,6 +117,7 @@ export function authRoutes(db: Db): Router {
       return;
     }
 
+    if (nameKey) limits?.loginName.reset(nameKey);
     setAuthCookie(res, record);
     res.json({ user: toPublicUser(record) });
   });

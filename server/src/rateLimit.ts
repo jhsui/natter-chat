@@ -4,12 +4,16 @@
  * instances would each keep their own.
  */
 
+import { isIPv6 } from "node:net";
+import type { Response } from "express";
+import type { ErrorResponse } from "../../shared/types.js";
+
 export interface RateLimitOptions {
   /** Sign-in attempts from one IP per `loginWindowMs`. Default: 30. */
   loginPerIp?: number;
   /**
-   * Failed sign-ins for one username from one IP per `loginWindowMs`.
-   * Default: 10.
+   * Sign-in tries for one username from one IP per `loginWindowMs`; a
+   * successful one clears the count. Default: 10.
    */
   loginFailuresPerName?: number;
   /** Default: 15 minutes. */
@@ -72,40 +76,54 @@ export function createRateLimiter({
   windowMs: number;
   now?: () => number;
 }): RateLimiter {
+  if (!Number.isInteger(limit) || limit < 0)
+    throw new RangeError(`Invalid rate limit: ${limit}`);
+  if (!Number.isFinite(windowMs) || windowMs <= 0)
+    throw new RangeError(`Invalid rate limit window: ${windowMs}`);
+
   /** When each key's recent attempts happened, oldest first. */
   const attempts = new Map<string, number[]>();
 
-  /** The attempts for `key` inside the window; forgets the key if none are. */
-  function recent(key: string): number[] {
-    const cutoff = now() - windowMs;
+  /** The attempts for `key` in the window up to `time`; forgets it if none. */
+  function recent(key: string, time: number): number[] {
+    const cutoff = time - windowMs;
     const times = (attempts.get(key) ?? []).filter((t) => t > cutoff);
     if (times.length > 0) attempts.set(key, times);
     else attempts.delete(key);
     return times;
   }
 
-  function result(times: number[]): RateLimitResult {
+  function result(times: number[], time: number): RateLimitResult {
     if (times.length < limit) return { ok: true };
     // Refused attempts aren't counted, so there are never more than `limit`
     // and the oldest one is the next to leave the window.
-    const oldest = times[0] ?? now();
-    return { ok: false, retryAfterMs: oldest + windowMs - now() };
+    const oldest = times[0] ?? time;
+    return { ok: false, retryAfterMs: oldest + windowMs - time };
   }
 
   // Clear out keys nobody has used for a while, so memory stays bounded.
-  const timer = setInterval(() => {
-    for (const key of attempts.keys()) recent(key);
-  }, windowMs);
+  const timer = setInterval(
+    () => {
+      const time = now();
+      for (const key of attempts.keys()) recent(key, time);
+    },
+    Math.max(windowMs, 1000),
+  );
   timer.unref(); // don't keep the process alive just for this
 
   return {
     hit(key) {
-      const times = recent(key);
-      const answer = result(times);
-      if (answer.ok) attempts.set(key, [...times, now()]);
+      // One reading of the clock, so the wait can't come out as zero.
+      const time = now();
+      const times = recent(key, time);
+      const answer = result(times, time);
+      if (answer.ok) attempts.set(key, [...times, time]);
       return answer;
     },
-    check: (key) => result(recent(key)),
+    check(key) {
+      const time = now();
+      return result(recent(key, time), time);
+    },
     reset(key) {
       attempts.delete(key);
     },
@@ -113,11 +131,68 @@ export function createRateLimiter({
   };
 }
 
+/** Whole seconds to wait, at least 1, as sent in `retryAfterSeconds`. */
+export function retryAfterSeconds(ms: number): number {
+  return Math.max(1, Math.ceil(ms / 1000));
+}
+
+/**
+ * If `result` is over the limit, replies 429 with how long to wait (as
+ * `retryAfterSeconds` and a Retry-After header) and returns true.
+ * `what` names the attempts, e.g. "sign-in attempts".
+ */
+export function refuseIfLimited<T>(
+  res: Response<T | ErrorResponse>,
+  result: RateLimitResult,
+  what: string,
+): boolean {
+  if (result.ok) return false;
+  const seconds = retryAfterSeconds(result.retryAfterMs);
+  res.set("Retry-After", String(seconds));
+  res.status(429).json({
+    error: `Too many ${what}. Try again in ${seconds} seconds.`,
+    retryAfterSeconds: seconds,
+  });
+  return true;
+}
+
+/**
+ * The key an IP address is limited under. IPv6 addresses are grouped by their
+ * first 64 bits, since one machine usually has a whole /64 to pick from.
+ */
+export function ipKey(ip: string | undefined): string {
+  if (!ip) return "unknown";
+  const address = ip.split("%")[0] ?? ip; // drop a zone, as in fe80::1%eth0
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  if (mapped?.[1]) return mapped[1]; // IPv4 written as IPv6
+  if (!isIPv6(address)) return address;
+
+  // Write out the groups that "::" leaves out. An IPv4 part at the end (as in
+  // 64:ff9b::1.2.3.4) stands for two groups.
+  const groupsOf = (part: string) =>
+    part === ""
+      ? []
+      : part.split(":").flatMap((g) => (g.includes(".") ? ["0", "0"] : [g]));
+  const [head = "", tail = ""] = address.split("::");
+  const left = groupsOf(head);
+  const right = groupsOf(tail);
+  const groups = [
+    ...left,
+    ...Array<string>(8 - left.length - right.length).fill("0"),
+    ...right,
+  ];
+  const prefix = groups
+    .slice(0, 4)
+    .map((g) => parseInt(g, 16).toString(16))
+    .join(":");
+  return `${prefix}::/64`;
+}
+
 /** The limiters the routes and socket handlers use. */
 export interface RateLimits {
   /** Every sign-in attempt, by IP. */
   loginIp: RateLimiter;
-  /** Failed sign-ins, by IP and lowercased username. */
+  /** Sign-ins, by IP and lowercased username; a successful one clears it. */
   loginName: RateLimiter;
   /** Every sign-up attempt, by IP. */
   register: RateLimiter;

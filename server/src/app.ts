@@ -135,7 +135,7 @@ export async function createServer({
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
   });
-  app.use("/api/auth", authRoutes(db), demoRoutes(db, bot, settings));
+  app.use("/api/auth", authRoutes(db, limits), demoRoutes(db, bot, settings));
   // Everything else under /api needs a signed-in user.
   app.use(
     "/api",

@@ -7,8 +7,9 @@ import type {
   ServerToClientEvents,
 } from "../../shared/types.js";
 import pg from "pg";
-import { createServer, type ChatApp } from "../src/app.js";
+import { createServer, type ChatApp, type ServerOptions } from "../src/app.js";
 import type { DbConfig } from "../src/db.js";
+import type { RateLimitOptions } from "../src/rateLimit.js";
 
 type ClientSocket = Socket<ServerToClientEvents, ClientToServerEvents>;
 
@@ -89,8 +90,11 @@ before(async () => {
 
 after(() => server.close());
 
-/** Tiny HTTP client that remembers the auth cookie, like a browser would. */
-function client() {
+/**
+ * Tiny HTTP client that remembers the auth cookie, like a browser would. It
+ * talks to the main test server unless given another one's URL.
+ */
+function client(url?: string, extraHeaders: Record<string, string> = {}) {
   let cookie = "";
   return {
     get cookie() {
@@ -101,15 +105,15 @@ function client() {
       method: string,
       path: string,
       body?: unknown,
-    ): Promise<{ status: number; body: any }> {
-      const res = await fetch(baseUrl + path, {
+    ): Promise<{ status: number; body: any; headers: Headers }> {
+      const res = await fetch((url ?? baseUrl) + path, {
         method,
-        headers: { "Content-Type": "application/json", cookie },
+        headers: { "Content-Type": "application/json", cookie, ...extraHeaders },
         body: body ? JSON.stringify(body) : undefined,
       });
       const setCookie = res.headers.get("set-cookie");
       if (setCookie) cookie = setCookie.split(";")[0] ?? "";
-      return { status: res.status, body: await res.json() };
+      return { status: res.status, body: await res.json(), headers: res.headers };
     },
     /** Sends raw bytes, like the browser does for avatar and image uploads. */
     async upload(
@@ -118,9 +122,9 @@ function client() {
       contentType: string,
       method = "PUT",
     ): Promise<{ status: number; body: any }> {
-      const res = await fetch(baseUrl + path, {
+      const res = await fetch((url ?? baseUrl) + path, {
         method,
-        headers: { "Content-Type": contentType, cookie },
+        headers: { "Content-Type": contentType, cookie, ...extraHeaders },
         body: new Uint8Array(data),
       });
       return { status: res.status, body: await res.json() };
@@ -994,5 +998,233 @@ test("uploads explain when storage isn't configured", async () => {
     assert.equal(image.status, 503);
   } finally {
     await bare.close();
+  }
+});
+
+// ---- Rate limits ---------------------------------------------------------------
+
+/**
+ * Starts a server of its own with rate limits on, and a clock the test moves
+ * by hand (`clock.now += ms`) instead of waiting.
+ */
+async function limitedServer(
+  rateLimits: RateLimitOptions,
+  options: Partial<ServerOptions> = {},
+) {
+  const clock = { now: 1_000_000 };
+  const limited = await createServer({
+    db: { pgliteDir: "memory://" },
+    avatarStorage: null,
+    chatImageStorage: null,
+    linkPreviews: null,
+    rateLimits: { ...rateLimits, now: () => clock.now },
+    ...options,
+  });
+  await new Promise<void>((resolve) => limited.httpServer.listen(0, resolve));
+  const url = `http://localhost:${(limited.httpServer.address() as AddressInfo).port}`;
+  return { url, clock, close: () => limited.close() };
+}
+
+const MINUTE = 60 * 1000;
+
+test("sign-in: wrong passwords are limited per username and IP, until the wait is over", async () => {
+  const { url, clock, close } = await limitedServer({ loginFailuresPerName: 3 });
+  try {
+    const signIn = (username: string, password: string) =>
+      client(url).request("POST", "/api/auth/login", { username, password });
+    const reg = await client(url).request("POST", "/api/auth/register", {
+      username: "rl_victim",
+      password: "secret1",
+    });
+    assert.equal(reg.status, 201);
+
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await signIn("rl_victim", "wrong!!")).status, 401);
+    }
+    // Now even the right password is refused (in any capitalisation), so
+    // guessing can't go on by watching for a different answer.
+    const r = await signIn("RL_Victim", "secret1");
+    assert.equal(r.status, 429);
+    assert.equal(r.body.retryAfterSeconds, 15 * 60);
+    assert.equal(r.headers.get("retry-after"), "900");
+    assert.match(r.body.error, /Too many sign-in attempts/);
+    assert.equal(r.headers.get("set-cookie"), null);
+
+    // Someone else signing in from the same IP isn't affected.
+    assert.equal((await signIn("rl_other", "whatever")).status, 401);
+
+    clock.now += 15 * MINUTE;
+    assert.equal((await signIn("rl_victim", "secret1")).status, 200);
+
+    // Signing in starts the count again.
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await signIn("rl_victim", "wrong!!")).status, 401);
+    }
+    assert.equal((await signIn("rl_victim", "secret1")).status, 200);
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await signIn("rl_victim", "wrong!!")).status, 401);
+    }
+    assert.equal((await signIn("rl_victim", "secret1")).status, 429);
+  } finally {
+    await close();
+  }
+});
+
+test("sign-in: failures from one IP don't lock the account for other IPs", async () => {
+  const { url, close } = await limitedServer(
+    { loginFailuresPerName: 3 },
+    { trustProxy: 1 },
+  );
+  try {
+    const signIn = (ip: string, password: string) =>
+      client(url, { "X-Forwarded-For": ip }).request(
+        "POST",
+        "/api/auth/login",
+        { username: "rl_victim", password },
+      );
+    await client(url).request("POST", "/api/auth/register", {
+      username: "rl_victim",
+      password: "secret1",
+    });
+    for (let i = 0; i < 3; i++) {
+      assert.equal((await signIn("203.0.113.1", "wrong!!")).status, 401);
+    }
+    assert.equal((await signIn("203.0.113.1", "secret1")).status, 429);
+    // The real owner, somewhere else, can still sign in.
+    assert.equal((await signIn("203.0.113.2", "secret1")).status, 200);
+  } finally {
+    await close();
+  }
+});
+
+test("sign-in: parallel guesses can't get past the per-username limit", async () => {
+  const { url, close } = await limitedServer({ loginFailuresPerName: 3 });
+  try {
+    await client(url).request("POST", "/api/auth/register", {
+      username: "rl_victim",
+      password: "secret1",
+    });
+    // Enough at once that some arrive while others are still being checked
+    // (fewer than the 30 allowed per IP).
+    const statuses = await Promise.all(
+      Array.from({ length: 25 }, () =>
+        client(url)
+          .request("POST", "/api/auth/login", {
+            username: "rl_victim",
+            password: "wrong!!",
+          })
+          .then((r) => r.status),
+      ),
+    );
+    assert.equal(statuses.filter((s) => s === 401).length, 3);
+    assert.equal(statuses.filter((s) => s === 429).length, 22);
+  } finally {
+    await close();
+  }
+});
+
+test("sign-in: one IP trying many usernames hits the per-IP limit", async () => {
+  const { url, close } = await limitedServer({ loginPerIp: 4 });
+  try {
+    await client(url).request("POST", "/api/auth/register", {
+      username: "rl_real",
+      password: "secret1",
+    });
+    const c = client(url);
+    // Missing and oversized names count too.
+    assert.equal((await c.request("POST", "/api/auth/login", {})).status, 401);
+    assert.equal(
+      (
+        await c.request("POST", "/api/auth/login", {
+          username: "x".repeat(5000),
+          password: "secret1",
+        })
+      ).status,
+      401,
+    );
+    for (const username of ["nobody_1", "nobody_2"]) {
+      assert.equal(
+        (await c.request("POST", "/api/auth/login", { username, password: "p" }))
+          .status,
+        401,
+      );
+    }
+    const r = await c.request("POST", "/api/auth/login", {
+      username: "rl_real",
+      password: "secret1",
+    });
+    assert.equal(r.status, 429);
+    assert.equal(r.body.retryAfterSeconds, 15 * 60);
+  } finally {
+    await close();
+  }
+});
+
+test("sign-up: every attempt from an IP counts, and a refused one creates no account", async () => {
+  const { url, clock, close } = await limitedServer({ registerPerIp: 3 });
+  try {
+    const signUp = (username: string) =>
+      client(url).request("POST", "/api/auth/register", {
+        username,
+        password: "secret1",
+      });
+    assert.equal((await signUp("a")).status, 400);
+    assert.equal((await signUp("rl_new")).status, 201);
+    assert.equal((await signUp("RL_NEW")).status, 409);
+
+    const r = await signUp("rl_late");
+    assert.equal(r.status, 429);
+    assert.equal(r.body.retryAfterSeconds, 60 * 60);
+    assert.equal(r.headers.get("retry-after"), "3600");
+    assert.match(r.body.error, /Too many sign-up attempts/);
+    assert.equal(r.headers.get("set-cookie"), null);
+    const login = await client(url).request("POST", "/api/auth/login", {
+      username: "rl_late",
+      password: "secret1",
+    });
+    assert.equal(login.status, 401, "the refused sign-up made no account");
+
+    clock.now += 60 * MINUTE;
+    assert.equal((await signUp("rl_late")).status, 201);
+  } finally {
+    await close();
+  }
+});
+
+test("X-Forwarded-For is only believed behind a trusted proxy; IPv6 is limited per /64", async () => {
+  const tryFrom = (url: string, ip: string) =>
+    client(url, { "X-Forwarded-For": ip }).request("POST", "/api/auth/login", {
+      username: "nobody",
+      password: "wrong!!",
+    });
+
+  // No proxy: a made-up header doesn't give anyone a fresh budget.
+  const direct = await limitedServer({ loginPerIp: 2 });
+  try {
+    assert.equal((await tryFrom(direct.url, "203.0.113.1")).status, 401);
+    assert.equal((await tryFrom(direct.url, "203.0.113.2")).status, 401);
+    assert.equal((await tryFrom(direct.url, "203.0.113.3")).status, 429);
+  } finally {
+    await direct.close();
+  }
+
+  // Behind one proxy: each visitor has a budget of their own.
+  const proxied = await limitedServer({ loginPerIp: 2 }, { trustProxy: 1 });
+  try {
+    assert.equal((await tryFrom(proxied.url, "203.0.113.1")).status, 401);
+    assert.equal((await tryFrom(proxied.url, "203.0.113.1")).status, 401);
+    assert.equal((await tryFrom(proxied.url, "203.0.113.1")).status, 429);
+    assert.equal((await tryFrom(proxied.url, "203.0.113.2")).status, 401);
+
+    // Addresses in the same /64 share a budget.
+    assert.equal((await tryFrom(proxied.url, "2001:db8:1:2::1")).status, 401);
+    assert.equal(
+      (await tryFrom(proxied.url, "2001:db8:1:2:ffff::9")).status,
+      401,
+    );
+    assert.equal((await tryFrom(proxied.url, "2001:db8:1:2::abcd")).status, 429);
+    assert.equal((await tryFrom(proxied.url, "2001:db8:1:3::1")).status, 401);
+  } finally {
+    await proxied.close();
   }
 });

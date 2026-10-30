@@ -158,6 +158,8 @@ export interface MessageResponse {
 
 export interface ErrorResponse {
   error: string;
+  /** With a 429 (too many attempts): how many seconds to wait before trying again. */
+  retryAfterSeconds?: number;
 }
 
 // ---- Socket.IO events --------------------------------------------------------
