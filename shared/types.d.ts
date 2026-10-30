@@ -165,7 +165,9 @@ export interface ErrorResponse {
 // ---- Socket.IO events --------------------------------------------------------
 
 export type SendMessageAck =
-  { ok: true; message: Message } | { ok?: false; error: string };
+  | { ok: true; message: Message }
+  // retryAfterSeconds: when sending too fast, how many seconds to wait.
+  | { ok?: false; error: string; retryAfterSeconds?: number };
 
 export type Ack = { ok: true } | { ok?: false; error: string };
 

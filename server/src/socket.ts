@@ -11,6 +11,7 @@ import { COOKIE_NAME, verifyToken } from "./auth.js";
 import { isValidId, toPublicUser, type Db } from "./db.js";
 import { findFirstUrl, type LinkPreviewFetcher } from "./linkPreview.js";
 import type { Presence } from "./presence.js";
+import { limitedError, type RateLimits } from "./rateLimit.js";
 import type { ChatImageStorage } from "./storage.js";
 
 const MAX_MESSAGE_LENGTH = 2000;
@@ -89,6 +90,7 @@ export function attachSocket(
     corsOrigin,
     chatImageStorage,
     linkPreviews,
+    limits,
     onMessage,
     onConnect,
   }: {
@@ -97,6 +99,8 @@ export function attachSocket(
     chatImageStorage?: ChatImageStorage | null;
     /** Looks up previews for links in messages; leave out to turn previews off. */
     linkPreviews?: LinkPreviewFetcher | null;
+    /** Limits how fast each user can send messages; leave out for no limit. */
+    limits?: RateLimits | null;
     /** Called with each text message after it has been delivered (Natter Bot listens here). */
     onMessage?: (message: Message) => void;
     /** Called when a user opens a connection. */
@@ -137,6 +141,12 @@ export function attachSocket(
     // Payloads come from the network, so validate them even though they're typed.
     socket.on("message:send", (payload, ack) => {
       const reply = typeof ack === "function" ? ack : () => {};
+      // Counted as it arrives, before the queue, so a flood can't pile up in
+      // it. One budget per user, shared by every tab and by picture uploads.
+      const limited = limits?.hitMessage(me.id);
+      if (limited && !limited.ok)
+        return reply(limitedError("messages", limited.retryAfterMs));
+
       sendQueue = sendQueue.then(async () => {
         const to = Number(payload?.to);
         const body =

@@ -1,5 +1,10 @@
 import { randomUUID } from "node:crypto";
-import express, { Router, type Request, type Response } from "express";
+import express, {
+  Router,
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import type {
   ConversationsResponse,
   ErrorResponse,
@@ -12,6 +17,7 @@ import type {
 import { currentUser } from "../auth.js";
 import { isValidId, toPublicUser, type Db } from "../db.js";
 import type { Presence } from "../presence.js";
+import { refuseIfLimited, type RateLimits } from "../rateLimit.js";
 import {
   detectImageType,
   IMAGE_EXTENSIONS,
@@ -32,6 +38,8 @@ export function chatRoutes(
   storage: ChatImageStorage | null,
   /** Called with each message created here, to deliver it to connected clients. */
   onMessage: (message: Message) => void,
+  /** How fast each user can send (pictures and texts); null for no limit. */
+  limits: RateLimits | null,
 ): Router {
   const router = Router();
 
@@ -106,6 +114,14 @@ export function chatRoutes(
   // use HTTP because they're big and need a size limit and upload errors.
   router.post(
     "/messages/:userId/image",
+    // Counted before the upload is read, so a refused one is never kept in
+    // memory (Node still receives the bytes, and throws them away).
+    // Pictures and texts share the sender's budget (see socket.ts).
+    (req: Request, res: Response<ErrorResponse>, next: NextFunction) => {
+      const result = limits?.hitMessage(currentUser(req).id);
+      if (result && refuseIfLimited(res, result, "messages")) return;
+      next();
+    },
     express.raw({ type: "image/*", limit: MAX_IMAGE_BYTES }),
     async (req: Request, res: Response<MessageResponse | ErrorResponse>) => {
       if (!storage) {

@@ -9,7 +9,7 @@ import type {
   PublicUser,
   ServerToClientEvents,
 } from "../../../shared/types";
-import { ApiError, api } from "../api.ts";
+import { ApiError, api, tooManyAttempts } from "../api.ts";
 import type { ChatImage } from "../image.ts";
 import Sidebar from "./Sidebar.tsx";
 import SidebarResizer from "./SidebarResizer.tsx";
@@ -351,7 +351,13 @@ export default function ChatPage({
     } catch {
       throw new Error("Message timed out — try again");
     }
-    if (!res.ok) throw new Error(res.error);
+    if (!res.ok) {
+      throw new Error(
+        res.retryAfterSeconds === undefined
+          ? res.error
+          : tooManyAttempts(res.retryAfterSeconds),
+      );
+    }
   }
 
   // Images are uploaded over HTTP; the server then announces the new message

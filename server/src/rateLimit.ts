@@ -136,10 +136,18 @@ export function retryAfterSeconds(ms: number): number {
   return Math.max(1, Math.ceil(ms / 1000));
 }
 
+/** The error for going over a limit; `what` names the attempts ("messages"). */
+export function limitedError(what: string, retryAfterMs: number) {
+  const seconds = retryAfterSeconds(retryAfterMs);
+  return {
+    error: `Too many ${what}. Try again in ${seconds} seconds.`,
+    retryAfterSeconds: seconds,
+  } satisfies ErrorResponse;
+}
+
 /**
  * If `result` is over the limit, replies 429 with how long to wait (as
  * `retryAfterSeconds` and a Retry-After header) and returns true.
- * `what` names the attempts, e.g. "sign-in attempts".
  */
 export function refuseIfLimited<T>(
   res: Response<T | ErrorResponse>,
@@ -147,12 +155,9 @@ export function refuseIfLimited<T>(
   what: string,
 ): boolean {
   if (result.ok) return false;
-  const seconds = retryAfterSeconds(result.retryAfterMs);
-  res.set("Retry-After", String(seconds));
-  res.status(429).json({
-    error: `Too many ${what}. Try again in ${seconds} seconds.`,
-    retryAfterSeconds: seconds,
-  });
+  const reply = limitedError(what, result.retryAfterMs);
+  res.set("Retry-After", String(reply.retryAfterSeconds));
+  res.status(429).json(reply);
   return true;
 }
 
@@ -196,8 +201,11 @@ export interface RateLimits {
   loginName: RateLimiter;
   /** Every sign-up attempt, by IP. */
   register: RateLimiter;
-  /** Messages sent, by user id: all tabs and picture uploads share one budget. */
-  messages: RateLimiter;
+  /**
+   * Counts a message `userId` is sending. Texts from every tab and picture
+   * uploads all go through here, so they share one budget per user.
+   */
+  hitMessage(userId: number): RateLimitResult;
   stop(): void;
 }
 
@@ -225,8 +233,10 @@ export function createRateLimits(settings: RateLimitSettings): RateLimits {
       now,
     }),
   };
+  const { messages, ...byIp } = limits;
   return {
-    ...limits,
+    ...byIp,
+    hitMessage: (userId) => messages.hit(String(userId)),
     stop() {
       for (const limiter of Object.values(limits)) limiter.stop();
     },

@@ -435,6 +435,39 @@ test("a picture sent to Natter Bot gets a reaction and a reply", async () => {
 
 // ---- Limits and cleanup, on a server whose guests expire quickly -------------
 
+test("guests are limited in how fast they send, but Natter Bot isn't", async () => {
+  const clock = { now: 1_000_000 };
+  const { server, baseUrl } = await start({
+    demo: { botTiming: instantBot },
+    rateLimits: { messagesPerUser: 2, now: () => clock.now },
+  });
+  try {
+    const botId = server.demo!.bot.user.id;
+    const guest = clientOf(baseUrl);
+    assert.equal((await guest.request("POST", "/api/auth/demo")).status, 201);
+    const socket = await socketFor(baseUrl, guest);
+    const bot = watch(socket, botId);
+    await bot.next(); // the tip
+    const say = (body: string) =>
+      socket.emitWithAck("message:send", { to: botId, body });
+
+    assert.ok((await say("hi")).ok);
+    // More than the guest's 2 messages: the bot isn't held to the limit.
+    await bot.next(2);
+    assert.ok((await say("cool")).ok);
+    assert.deepEqual(await say("one more"), {
+      error: "Too many messages. Try again in 10 seconds.",
+      retryAfterSeconds: 10,
+    });
+
+    clock.now += 10 * 1000;
+    assert.ok((await say("one more")).ok);
+    socket.disconnect();
+  } finally {
+    await server.close();
+  }
+});
+
 test("expired guests are deleted with their messages and files; new ones are rate-limited", async () => {
   const storage = fakeStorages();
   const { server, baseUrl } = await start({

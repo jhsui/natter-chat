@@ -94,12 +94,16 @@ export async function createServer({
   const presence = createPresence();
   const app = express();
   const httpServer = http.createServer(app);
+  const limits = rateLimits
+    ? createRateLimits(rateLimitSettings(rateLimits))
+    : null;
   // Natter Bot is created below, once the socket server it talks through exists.
   let bot: Bot | null = null;
   const io = attachSocket(httpServer, db, presence, {
     corsOrigin,
     chatImageStorage,
     linkPreviews,
+    limits,
     onMessage: (message) => bot?.receive(message),
     onConnect: (user) => bot?.connected(user.id),
   });
@@ -123,10 +127,6 @@ export async function createServer({
     );
   }
 
-  const limits = rateLimits
-    ? createRateLimits(rateLimitSettings(rateLimits))
-    : null;
-
   app.disable("x-powered-by");
   if (trustProxy !== false) app.set("trust proxy", trustProxy);
   app.use(express.json({ limit: "10kb" }));
@@ -140,10 +140,16 @@ export async function createServer({
   app.use(
     "/api",
     requireAuth(db),
-    chatRoutes(db, presence, chatImageStorage, (message) => {
-      emitNewMessage(io, message);
-      bot?.receive(message); // a picture sent to Natter Bot gets an answer too
-    }),
+    chatRoutes(
+      db,
+      presence,
+      chatImageStorage,
+      (message) => {
+        emitNewMessage(io, message);
+        bot?.receive(message); // a picture sent to Natter Bot gets an answer too
+      },
+      limits,
+    ),
     profileRoutes(db, presence, avatarStorage, (user) =>
       io.emit("profile:updated", user),
     ),

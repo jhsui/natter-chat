@@ -133,9 +133,10 @@ function client(url?: string, extraHeaders: Record<string, string> = {}) {
 }
 type Client = ReturnType<typeof client>;
 
-function socketFor(c: Client): Promise<ClientSocket> {
+/** Connects `c`, to the main test server unless given another one's URL. */
+function socketFor(c: Client, url?: string): Promise<ClientSocket> {
   return new Promise((resolve, reject) => {
-    const s: ClientSocket = connect(baseUrl, {
+    const s: ClientSocket = connect(url ?? baseUrl, {
       extraHeaders: { cookie: c.cookie },
       transports: ["websocket"],
     });
@@ -1226,5 +1227,202 @@ test("X-Forwarded-For is only believed behind a trusted proxy; IPv6 is limited p
     assert.equal((await tryFrom(proxied.url, "2001:db8:1:3::1")).status, 401);
   } finally {
     await proxied.close();
+  }
+});
+
+/** Signs up `username` on the server at `url`; returns the client and the new id. */
+async function signedUp(url: string, username: string) {
+  const c = client(url);
+  const r = await c.request("POST", "/api/auth/register", {
+    username,
+    password: "secret1",
+  });
+  assert.equal(r.status, 201);
+  return { c, id: r.body.user.id as number };
+}
+
+const tooFast = {
+  error: "Too many messages. Try again in 10 seconds.",
+  retryAfterSeconds: 10,
+};
+
+test("messages: one budget per user across all tabs, and others can still send", async () => {
+  const { url, clock, close } = await limitedServer({ messagesPerUser: 3 });
+  const sockets: ClientSocket[] = [];
+  try {
+    const ann = await signedUp(url, "rl_ann");
+    const ben = await signedUp(url, "rl_ben");
+    const [tab1, tab2, benSocket] = await Promise.all([
+      socketFor(ann.c, url),
+      socketFor(ann.c, url),
+      socketFor(ben.c, url),
+    ]);
+    sockets.push(tab1, tab2, benSocket);
+    const fromAnn: string[] = [];
+    benSocket.on("message:new", (m) => {
+      if (m.senderId === ann.id) fromAnn.push(m.body);
+    });
+    const send = (tab: ClientSocket, body: string) =>
+      tab.emitWithAck("message:send", { to: ben.id, body });
+
+    // A flood from two tabs at once: three get through, the rest are refused.
+    const acks = await Promise.all(
+      ["1", "2", "3", "4", "5"].map((body, i) =>
+        send(i % 2 ? tab2 : tab1, body),
+      ),
+    );
+    const sent = acks.flatMap((a) => (a.ok ? [a.message.body] : []));
+    assert.equal(sent.length, 3);
+    assert.deepEqual(
+      acks.filter((a) => !a.ok),
+      [tooFast, tooFast],
+    );
+
+    // Ben isn't held back by Ann's limit. His own message comes back to him
+    // after everything sent to him before it, so Ann's are all in by then.
+    const benEcho = new Promise<void>((resolve) => {
+      benSocket.on("message:new", (m) => {
+        if (m.senderId === ben.id) resolve();
+      });
+    });
+    const benAck = await benSocket.emitWithAck("message:send", {
+      to: ann.id,
+      body: "slow down",
+    });
+    assert.ok(benAck.ok);
+    await benEcho;
+    assert.deepEqual(fromAnn.sort(), [...sent].sort());
+    const history = (await ann.c.request("GET", `/api/messages/${ben.id}`)).body;
+    assert.deepEqual(
+      history.messages
+        .filter((m: { senderId: number }) => m.senderId === ann.id)
+        .map((m: { body: string }) => m.body)
+        .sort(),
+      [...sent].sort(),
+      "refused messages aren't saved",
+    );
+
+    // Once the window has passed, Ann can send again. Empty messages count too.
+    clock.now += 10 * 1000;
+    assert.deepEqual(await send(tab1, "   "), { error: "Message is empty" });
+    assert.ok((await send(tab2, "6")).ok);
+    assert.ok((await send(tab1, "7")).ok);
+    assert.deepEqual(await send(tab2, "8"), tooFast);
+  } finally {
+    for (const s of sockets) s.disconnect();
+    await close();
+  }
+});
+
+/** Waits for `promise`, failing after `ms` with what was missing instead of hanging. */
+async function within<T>(promise: Promise<T>, what: string, ms = 2000) {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for ${what}`)),
+      ms,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+test("messages: over the limit, you still get messages live, and typing and read receipts work", async () => {
+  const { url, close } = await limitedServer({ messagesPerUser: 2 });
+  const sockets: ClientSocket[] = [];
+  try {
+    const ann = await signedUp(url, "rl_ann");
+    const ben = await signedUp(url, "rl_ben");
+    const [annSocket, benSocket] = await Promise.all([
+      socketFor(ann.c, url),
+      socketFor(ben.c, url),
+    ]);
+    sockets.push(annSocket, benSocket);
+    const send = (body: string) =>
+      annSocket.emitWithAck("message:send", { to: ben.id, body });
+
+    assert.ok((await send("1")).ok);
+    assert.ok((await send("2")).ok);
+    assert.deepEqual(await within(send("3"), "the refused send's answer"), tooFast);
+
+    // Ben's message still reaches Ann as it's sent.
+    const arrived = once(annSocket, "message:new");
+    const benAck = await benSocket.emitWithAck("message:send", {
+      to: ann.id,
+      body: "you there?",
+    });
+    assert.ok(benAck.ok);
+    assert.equal((await within(arrived, "Ben's message")).body, "you there?");
+
+    // Ann's typing indicator still reaches Ben.
+    const typing = once(benSocket, "typing");
+    annSocket.emit("typing", { to: ben.id, typing: true });
+    assert.deepEqual(await within(typing, "Ann's typing indicator"), {
+      from: ann.id,
+      typing: true,
+    });
+
+    // Ann reads Ben's message, and Ben sees the read receipt.
+    const read = once(benSocket, "messages:read");
+    annSocket.emit("messages:read", { from: ben.id });
+    assert.deepEqual(await within(read, "the read receipt"), {
+      readerId: ann.id,
+      senderId: ben.id,
+      upToId: benAck.message.id,
+    });
+  } finally {
+    for (const s of sockets) s.disconnect();
+    await close();
+  }
+});
+
+test("messages: pictures share the sender's budget and are refused before upload", async () => {
+  const { url, close } = await limitedServer(
+    { messagesPerUser: 3 },
+    { chatImageStorage: fakeChatImages },
+  );
+  const sockets: ClientSocket[] = [];
+  try {
+    const ann = await signedUp(url, "rl_ann");
+    const ben = await signedUp(url, "rl_ben");
+    const annSocket = await socketFor(ann.c, url);
+    sockets.push(annSocket);
+    const picture = (c: Client, to: number) =>
+      c.upload(
+        `/api/messages/${to}/image?width=10&height=10`,
+        PNG,
+        "image/png",
+        "POST",
+      );
+
+    const text = await annSocket.emitWithAck("message:send", {
+      to: ben.id,
+      body: "a picture is coming",
+    });
+    assert.ok(text.ok);
+    assert.equal((await picture(ann.c, ben.id)).status, 201);
+    assert.equal((await picture(ann.c, ben.id)).status, 201);
+
+    const filesBefore = fakeChatImages.files.size;
+    const r = await picture(ann.c, ben.id);
+    assert.equal(r.status, 429);
+    assert.deepEqual(r.body, tooFast);
+    assert.equal(fakeChatImages.files.size, filesBefore, "nothing was stored");
+    // ...and texts are out too, since it's one budget.
+    assert.deepEqual(
+      await annSocket.emitWithAck("message:send", { to: ben.id, body: "hm" }),
+      tooFast,
+    );
+
+    // Signed out is still a 401, not a 429.
+    assert.equal((await picture(client(url), ben.id)).status, 401);
+    // Ben has a budget of his own.
+    assert.equal((await picture(ben.c, ann.id)).status, 201);
+  } finally {
+    for (const s of sockets) s.disconnect();
+    await close();
   }
 });
